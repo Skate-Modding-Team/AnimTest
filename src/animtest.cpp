@@ -3232,14 +3232,7 @@ extern "C" {
 
 //testing
 int main() {
-    //const char* DBFilename = "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/animationDB.abin";
-    //const char* DBFilename = "G:/Skate 2 (USA) (En,Fr)/PS3_GAME/USRDIR/data/big/data/anim/OnBoard.abin";
-    //const char* DBFilename = "H:/Skate 2 (Nov 28, 2008) [517560.515832.515600]/data/big/data/anim/OnBoard.abin";
-    //const char* DBFilename = "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/cac_female_throwarms.abin";
-    const char* DBFilename = "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/SkaterLeftHandPres.abin";
-    //const char* DBFilename = "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/cac_viewer_male.abin";
-    //const char* DBFilename = "D:/x360-eacanada-1009765(skate2)/Skate 3 Debug Build/data/big/data/scene/anim/ChanCenter_Sc_04_Masochist1.abin";
-    //const char* DBFilename = "G:/x360-eacanada-1009765(skate2)/Scene_02e_Artist1.abin";
+    const char* DBFilename = "C:/your/sample/animationdatabase.abin";
 
     Andale::FetchSys fs = loadAnimationDataBase(DBFilename);
     std::string names = load_database_and_get_names(DBFilename);
