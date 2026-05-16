@@ -261,7 +261,6 @@ namespace ANIM_CODEC {
         void Vector_UnPackFrameBlockAndDecompressOneFrame(const uint8_t* pCompressedData, ANIM_CODEC::DataPerDecompress* pWorkBuffer, uint8_t frameinBlk, uint8_t threadId);
         void DecompressFrame(const uint8_t* compressedData, uint32_t frame, uint32_t putLoc, uint8_t threadId);
         const uint8_t* UnPackHeaderBits(DataPerDecompress* pWorkBuffer);
-        uint32_t UnPackFrameBlockBits(int* a3, uint32_t* a4);
         uint32_t InitPerAnim(const uint8_t* compressedHeaderData, const uint8_t* headerData, uint8_t threadId);
     };
     namespace RawDiscretize {
@@ -953,16 +952,28 @@ namespace Andale {
     void ExtractPackedN(ExtractType* ExtractBuffer, uint32_t ExtractBuffSize);
     void ExtractPackedNVBR(ExtractType* ExtractBuffer, uint32_t ExtractBuffSize, ANIM_CODEC::VBRDecompressor* decompressor);
 
-    // Skeleton-free VBR extractor. Walks `animData->mPartsOffsets[]` in the file
-    // directly and decodes every part it finds, without going through BatchFetch's
-    // partID-vs-skeleton matching. Each part's SQTs land in their own slice of
-    // sqtBuffer, so you get the file's full content even when no skeleton matches.
-    // Returns the number of SQTs written. `maxBones` bounds the output buffer.
+    // VBR extractor. Walks the file's parts table directly (without
+    // BatchFetch's partID-vs-skeleton matching, which doesn't work for VBR --
+    // VBR parts carry no usable partID, their high byte is always 0).
+    //
+    // If `skel` is provided, the i-th VBR part is placed at the i-th skeleton
+    // part's `sqtOffset` (positional mapping): VBR clips list their parts in
+    // skeleton-part order, and the skeleton's parts contiguously partition all
+    // mNbBones bones, so positional placement reproduces the original game's
+    // bone indexing. If `skel` is null, falls back to contiguous stacking
+    // starting at sqtBuffer[0] (no rig positioning).
+    //
+    // Returns the highest bone index written (capped at maxBones).
+    // `isPose` selects the on-disk layout: poses store the parts table at +4
+    // (after a u32 totalParts count); clips store it at +52 (after AnimationData's
+    // trajectory/fps/frames header).
     uint32_t ExtractAllVBRParts(const DataHeader* hdr,
                                 uint32_t frameIndex,
                                 ANIM_CODEC::VBRDecompressor* decompressor,
                                 SQTData* sqtBuffer,
-                                uint32_t maxBones);
+                                uint32_t maxBones,
+                                bool isPose,
+                                const HierarchyData* skel);
 }
 
 void ANIM_CODEC::VBRChannelTypeBlockInfo::PutData(uint32_t frame, uint32_t joint, const float* newData, uint32_t putLoc) {
@@ -1156,91 +1167,6 @@ void ANIM_CODEC::VBRDecompressor::Init(uint32_t numBones) {
     }
 }
 
-/*
-void ANIM_CODEC::VBRDecompressor::DecompressFrameBlock(uint8_t frameinBlk, ANIM_CODEC::DataPerDecompress* pWorkBuffer, uint8_t threadId)
-{
-    uint32_t numChannels = *(uint8_t*)(pWorkBuffer->mIsConstantChannel + 0xC); // Read number of channels
-    if (pWorkBuffer->mUncompressedBlkDataScratch == 0) {
-        throw std::runtime_error("UncompressedBlkData != 0");
-    }
-
-    uint32_t usedTableOffset = pWorkBuffer->mUsedTableOffset;
-    uint32_t uncompressedBase = pWorkBuffer->mUncompressedBlkDataScratch;
-    uint32_t constDataBase = pWorkBuffer->mConstData;
-    uint32_t normalizedDataBase = pWorkBuffer->mNormalizedData;
-    uint32_t quantTableOffset = pWorkBuffer->mCompressedHeaderData;
-
-    uint32_t numBitsOffset = pWorkBuffer->mNumBitsOffset;
-    uint32_t frameOffset = pWorkBuffer->mFrameOffset;
-
-    uint32_t usedTableSize = (numBitsOffset + 3) & 0xFFFFFFFC;
-    uint32_t tableFlag = 0;
-
-    std::vector<uint8_t> channelUsed(numChannels, 0);
-
-    for (uint32_t i = 0; i < numChannels; ++i) {
-        uint8_t ch = *((uint8_t*)(usedTableOffset + i));
-        channelUsed[ch] = 0;
-    }
-
-    uint32_t initializedQuantTables = 0;
-
-    for (uint32_t i = 0; i < numChannels; ++i) {
-        uint8_t ch = *((uint8_t*)(usedTableOffset + i));
-        uint16_t blockStart = pWorkBuffer->mChannelBlockStarts[ch];
-        uint16_t blockEnd = pWorkBuffer->mChannelBlockEnds[ch];
-
-        if (blockStart == blockEnd) continue;
-
-        // Get decompression table info
-        VBRChannelTypeBlockInfo* blockInfo = &mChannelBlocks[ch];
-        uint32_t tableIndex = blockInfo->mData + 4 * frameinBlk;
-
-        uint8_t* tableFlagPtr = (uint8_t*)(blockInfo->mData + 8 * ch + normalizedDataBase + 0x25B0);
-        if (*tableFlagPtr == 0) {
-            *tableFlagPtr = 1;
-            ++initializedQuantTables;
-
-            // Simulate quantization table building
-            // Normally uses SIMD, here just scalar
-            float scale = 1.0f; // dummy
-            float table[64];
-            for (int j = 0; j < 64; ++j) {
-                table[j] = mInitialQuantizeTables[j] * scale;
-            }
-
-            // Save table
-            for (int j = 0; j < 64; ++j) {
-                mQuantizeTables[ch * 64 + j] = table[j];
-            }
-        }
-
-        // Simulate transform and write results
-        for (uint16_t j = blockStart; j < blockEnd; ++j) {
-            float inputBlock[64]; // Normally from SIMD
-            float quantizedBlock[64];
-
-            // Load from source (uncompressed)
-            for (int k = 0; k < 64; ++k) {
-                inputBlock[k] = ((float*)uncompressedBase)[j * 64 + k];
-            }
-
-            // Quantize and transform
-            for (int k = 0; k < 64; ++k) {
-                quantizedBlock[k] = inputBlock[k] * mQuantizeTables[ch * 64 + k];
-            }
-
-            // Store to normalized data
-            for (int k = 0; k < 64; ++k) {
-                ((float*)normalizedDataBase)[(frameinBlk * usedTableSize + j) * 64 + k] = quantizedBlock[k];
-            }
-        }
-    }
-
-    // Store quantization metadata
-    ((uint32_t*)(normalizedDataBase + 0x2DB0))[0] = initializedQuantTables;
-}
-*/
 
 // Read a big-endian 32-bit float stored at `p`.
 static inline float ReadBEFloat(const uint8_t* p) {
@@ -1389,48 +1315,6 @@ void ANIM_CODEC::VBRDecompressor::DecompressFrameBlock(
     const float vhalf           = 0.5f;
     const float quantBias       = scale * quantBiasFactor;
 
-    // [debug] dump the first few animated DFB calls with mFrameOffset >= 8
-    // (the diverging records have mFrameOffset 8 or 11; the mFrameOffset=3
-    // matching records previously dominated this trace).
-    // DFB diagnostic stays off by default (cluttered the normal extraction
-    // path's CSV output). Toggle to true to dump per-channel quantTable/coef
-    // when debugging IDCT scaling issues.
-    constexpr bool kDFBVerbose = false;
-    static int s_dfbTraced = 0;
-    const bool dfbTrace = kDFBVerbose && (s_dfbTraced < 3 && pWorkBuffer->mFrameOffset >= 8);
-    if (dfbTrace) {
-        ++s_dfbTraced;
-        std::cerr << "[DFB trace #" << s_dfbTraced << "] frameinBlk=" << (int)frameinBlk
-                  << " numChannels=" << numChannels
-                  << " mFrameOffset=" << pWorkBuffer->mFrameOffset
-                  << " frameOffsetAln=" << frameOffsetAln << "\n";
-        std::cerr << "  headerDump[0..15] (BE on disk):";
-        for (int i = 0; i < 16; ++i) {
-            std::cerr << ' ' << std::hex << std::setw(2) << std::setfill('0')
-                      << (unsigned)hdrBytes[i];
-        }
-        std::cerr << std::dec << std::setfill(' ') << "\n";
-        std::cerr << "  dctMin=" << dctMin
-                  << " dctMax=" << dctMax
-                  << " scale=" << scale
-                  << " scaleSquared=" << scaleSquared
-                  << " quantBias=" << quantBias << "\n";
-        std::cerr << "  idctCoef[8] =";
-        for (int i = 0; i < 8; ++i) std::cerr << ' ' << idctCoef[i];
-        std::cerr << "\n";
-        std::cerr << "  channelInfoBase offset from hdr = "
-                  << (channelInfoBaseB - hdrBytes) << "\n";
-        std::cerr << "  channelInfo[0..2] entries (raw 16 bytes each):\n";
-        for (int e = 0; e < std::min<int>(3, (int)numChannels); ++e) {
-            std::cerr << "    [ch=" << e << "]";
-            for (int i = 0; i < 16; ++i) {
-                std::cerr << ' ' << std::hex << std::setw(2) << std::setfill('0')
-                          << (unsigned)channelInfoBaseB[e * 16 + i];
-            }
-            std::cerr << std::dec << std::setfill(' ') << "\n";
-        }
-    }
-
     //--------------------------------------------------------
     // Per-channel processing
     //--------------------------------------------------------
@@ -1479,30 +1363,6 @@ void ANIM_CODEC::VBRDecompressor::DecompressFrameBlock(
             coef[i] = quantTable[i] * idctCoef[i];
         }
 
-        if (dfbTrace) {
-            std::cerr << "  ch=" << ch << " channelIndex=" << (int)channelIndex
-                      << " start=" << start << " end=" << end
-                      << " chMin=" << chMin << " chMax=" << chMax
-                      << " chRange=" << chRange << "\n";
-            std::cerr << "    quantTable=";
-            for (int i = 0; i < 8; ++i) std::cerr << ' ' << quantTable[i];
-            std::cerr << "\n    coef      =";
-            for (int i = 0; i < 8; ++i) std::cerr << ' ' << coef[i];
-            std::cerr << "\n";
-            // Print scratch bytes the IDCT is about to read for the first
-            // 16 ints (= bones 0 and 1's data) so we can verify they hold
-            // what the bit decoder said it wrote (-3.0f, -1.0f, 192f, ...).
-            const int* inp = uncompressed + (uint32_t)start * 8u;
-            std::cerr << "    scratch[start..start+16] as int :";
-            for (int i = 0; i < 16; ++i) std::cerr << ' ' << inp[i];
-            std::cerr << "\n    scratch[start..start+16] as flt :";
-            for (int i = 0; i < 16; ++i) {
-                float v; std::memcpy(&v, &inp[i], 4);
-                std::cerr << ' ' << v;
-            }
-            std::cerr << "\n";
-        }
-
         //----------------------------------------------------
         // Inner transform loop: each chunk of 32 ints -> 4 floats
         //----------------------------------------------------
@@ -1545,101 +1405,6 @@ void ANIM_CODEC::VBRDecompressor::DecompressFrameBlock(
     }
 }
 
-/*
-void ANIM_CODEC::VBRDecompressor::DecompressFrameBlock(uint8_t frameBlockIdx, ANIM_CODEC::DataPerDecompress* pWorkBuffer, uint8_t threadId)
-{
-    // Get basic information from work buffer
-    const uint8_t numChannels = pWorkBuffer->mCompressedHeaderData[12];
-    const uint32_t frameSizeAligned = (pWorkBuffer->mFrameOffset + 3) & ~3;
-
-    // Get pointers to the various data tables
-    float* quantTables = mQuantizeTables;
-    float* initialQuantTables = mInitialQuantizeTables;
-    float* idctTables = mIdctCoefTables;
-
-    // Get pointer to this frame block's working area
-    uint8_t* channelFlags = &mQuantTableInfo[frameBlockIdx].isInitialized;
-    uint32_t& constantChannelCount = mQuantTableInfo[frameBlockIdx].constantChannelCount;
-
-    // Validate required buffers
-    if (!pWorkBuffer->mUncompressedBlkDataScratch) {
-        std::cout << "Uncompressed block data buffer is null"s;
-        return;
-    }
-
-    // Reset channel flags for this frame block
-    for (uint32_t i = 0; i < numChannels; i++) {
-        uint8_t channelIdx = pWorkBuffer->mCompressedData[i];
-        channelFlags[channelIdx] = 0;
-    }
-    constantChannelCount = 0;
-
-    // Process each channel in this frame block
-    for (uint32_t ch = 0; ch < numChannels; ch++) {
-        uint8_t channelIdx = pWorkBuffer->mCompressedData[ch];
-        uint16_t blockStart = pWorkBuffer->mChannelBlockStarts[ch];
-        uint16_t blockEnd = pWorkBuffer->mChannelBlockEnds[ch];
-
-        if (blockStart == blockEnd) {
-            continue; // Skip empty channel blocks
-        }
-
-        // Get this channel's quantization table info
-        ChannelTableInfo& tableInfo = mQuantTableInfo[frameBlockIdx].channelTables[channelIdx];
-
-        // Initialize quantization tables if this is the first time we're using them
-        if (!tableInfo.isInitialized) {
-            tableInfo.isInitialized = true;
-
-            // Calculate new quantization tables from initial tables and IDCT coefficients
-            const float* srcInitialTable = &initialQuantTables[channelIdx * 64];
-            const float* srcIdctTable = &idctTables[channelIdx * 16];
-            float* destTable = &quantTables[constantChannelCount * 64];
-
-            // This would be matrix multiplication in SIMD, here done with regular loops
-            for (int i = 0; i < 8; i++) {
-                for (int j = 0; j < 8; j++) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < 8; k++) {
-                        sum += srcInitialTable[i * 8 + k] * srcIdctTable[k * 8 + j];
-                    }
-                    destTable[i * 8 + j] = sum;
-                }
-            }
-
-            tableInfo.tableOffset = constantChannelCount;
-            constantChannelCount++;
-        }
-
-        // Get the appropriate quantization table for this channel
-        const float* currentQuantTable = &quantTables[tableInfo.tableOffset * 64];
-        float* outputBuffer = pWorkBuffer->mNormalizedData + blockStart * 4;
-
-        // Decompress each block in this channel
-        for (uint32_t block = blockStart; block < blockEnd; block++) {
-            // Get quantized coefficients (4 values per block)
-            float coefficients[4];
-            for (int i = 0; i < 4; i++) {
-                coefficients[i] = currentQuantTable[block * 4 + i];
-            }
-
-            // Apply inverse DCT transform (simplified version)
-            float transformed[4];
-            for (int i = 0; i < 4; i++) {
-                transformed[i] = 0.0f;
-                for (int j = 0; j < 4; j++) {
-                    transformed[i] += coefficients[j] * idctTables[j * 4 + i];
-                }
-            }
-
-            // Store decompressed output
-            for (int i = 0; i < 4; i++) {
-                outputBuffer[block * 4 + i] = transformed[i];
-            }
-        }
-    }
-}
-*/
 void ANIM_CODEC::VBRDecompressor::Vector_UnPackFrameBlockAndDecompressOneFrame(
     const uint8_t* pCompressedData,
     ANIM_CODEC::DataPerDecompress* pWorkBuffer,
@@ -1852,60 +1617,6 @@ void ANIM_CODEC::VBRDecompressor::DecompressFrame(
     const uint8_t* fallbackB = reinterpret_cast<const uint8_t*>(workBuffer.mConstData);
     const uint8_t* isConstPtr = reinterpret_cast<const uint8_t*>(workBuffer.mIsConstantChannel);
 
-    // Per-clip diagnostic stays off by default (cluttered normal extraction
-    // output). Toggle to true to dump channel layout / mConstData on frame 0
-    // of each clip when investigating decode issues.
-    constexpr bool kDecompressFrameVerbose = false;
-    if (kDecompressFrameVerbose && frame == 0) {
-        std::cerr << "[DecompressFrame trace] numChannels=" << (int)numChannels
-                  << " mFrameOffset=" << workBuffer.mFrameOffset
-                  << " putLoc=0x" << std::hex << putLoc << std::dec << "\n";
-        const uint32_t channelInfoOff = (uint32_t)(channelInfoBase - workBuffer.mhdr);
-        const uint32_t end = channelInfoOff + 64;  // 4 entries x 16 bytes
-        std::cerr << "  hdr bytes [0.." << (end - 1) << "]: ";
-        for (uint32_t b = 0; b < end; ++b) {
-            std::cerr << std::hex << std::setw(2) << std::setfill('0')
-                      << (int)workBuffer.mhdr[b] << ' ';
-            if ((b & 0xF) == 0xF && b + 1 < end) std::cerr << "\n                     ";
-        }
-        std::cerr << std::dec << std::setfill(' ') << "\n";
-        std::cerr << "  paletteBase offset=" << (paletteBase - workBuffer.mhdr)
-                  << " (paletteSize=" << (int)workBuffer.mhdr[13] << ")"
-                  << " channelInfoBase offset=" << channelInfoOff << "\n";
-        for (uint8_t ch = 0; ch < numChannels; ++ch) {
-            const uint8_t* entry = channelInfoBase + (uint32_t)ch * 16u;
-            uint16_t nEnt   = Convert(*reinterpret_cast<const uint16_t*>(entry + 0));
-            uint16_t nConst = Convert(*reinterpret_cast<const uint16_t*>(entry + 2));
-            uint8_t  sz     = entry[12];
-            std::cerr << "  ch=" << (int)ch
-                      << " numEnt=" << nEnt << " numConst=" << nConst
-                      << " size=" << (int)sz
-                      << " (block.mDataSize=" << (int)mChannelBlocks[ch].mDataSize
-                      << " mOffset=0x" << std::hex << mChannelBlocks[ch].mOffset
-                      << " mStride=0x" << mChannelBlocks[ch].mStride << std::dec << ")\n";
-        }
-        // mCompressedHeaderData (palette indices + map runs)
-        std::cerr << "  mCompressedHeaderData[0..15]: ";
-        for (int b = 0; b < 16; ++b) {
-            std::cerr << std::hex << std::setw(2) << std::setfill('0')
-                      << (int)workBuffer.mCompressedHeaderData[b] << ' ';
-        }
-        std::cerr << std::dec << std::setfill(' ') << "\n";
-        // mConstData (decoded constant float values, expected ~10 floats for our t-pose)
-        std::cerr << "  mConstData[0..9]: ";
-        for (int i = 0; i < 10; ++i) {
-            std::cerr << workBuffer.mConstData[i] << ' ';
-        }
-        std::cerr << "\n";
-        // mIsConstantChannel (1 byte per joint -- expected layout per channel)
-        std::cerr << "  mIsConstantChannel[0..15]: ";
-        const uint8_t* icc = reinterpret_cast<const uint8_t*>(workBuffer.mIsConstantChannel);
-        for (int i = 0; i < 16; ++i) {
-            std::cerr << (int)icc[i] << ' ';
-        }
-        std::cerr << "\n";
-    }
-
     for (uint8_t ch = 0; ch < numChannels; ++ch) {
         const uint8_t* entry = channelInfoBase + (uint32_t)ch * 16u;
         uint16_t numEntPerFrm      = Convert(*reinterpret_cast<const uint16_t*>(entry + 0));
@@ -1928,92 +1639,6 @@ void ANIM_CODEC::VBRDecompressor::DecompressFrame(
         }
     }
 }
-
-uint32_t ANIM_CODEC::VBRDecompressor::UnPackFrameBlockBits(
-    int* a3,
-    uint32_t* a4)
-{
-    // Extract context values from the state pointer
-    const uint32_t frameOffset = a4[0xB]; // Frame offset in the block
-    const uint32_t* compressedData = reinterpret_cast<uint32_t*>(a4[5] + *a3);
-    const uint32_t numChannels = *reinterpret_cast<uint8_t*>(*a4 + 0xC);
-    int32_t* outputBuffer = reinterpret_cast<int32_t*>(a4[1]);
-
-    // Update context with current position
-    a4[3] = reinterpret_cast<uint32_t>(compressedData + numChannels);
-
-    // Read initial 32-bit value from compressed data (big-endian)
-    const uint32_t* dataPtr = compressedData + numChannels;
-    uint32_t bitBuffer = (Convert(*dataPtr));
-
-    // Skip the 4-byte header if there are frames to process
-    if (frameOffset != 0) {
-        dataPtr += 4;
-    }
-
-    uint32_t bitsAvailable = 32; // Tracks how many valid bits are in bitBuffer
-    const uint8_t* controlPtr = reinterpret_cast<uint8_t*>(a4[4]);
-
-    // Process each frame in the block
-    for (uint32_t frame = 0; frame < frameOffset; ++frame) {
-        int32_t* frameOutput = outputBuffer + frame;
-        uint8_t controlShift = 0;
-
-        // Process 8 channels per frame
-        for (uint32_t channel = 0; channel < 8; ++channel) {
-            int32_t value = 0;
-
-            // Extract 4-bit control value
-            uint32_t nibble = (*controlPtr >> (4 * (controlShift & 1))) & 0xF;
-            controlShift++;
-
-            if (nibble != 0) {
-                if (bitBuffer & 1) {
-                    // Extract variable-length value
-                    uint32_t bitCount = nibble;
-                    uint32_t mask = (1 << bitCount) - 1;
-
-                    value = (bitBuffer >> 2) & mask;
-                    if ((bitBuffer & 2) == 0) {
-                        value = -value; // Apply sign
-                    }
-
-                    // Consume bits
-                    bitBuffer >>= bitCount + 2;
-                    bitsAvailable -= bitCount + 2;
-                }
-                else {
-                    // Zero value
-                    bitBuffer >>= 1;
-                    bitsAvailable--;
-                }
-
-                // Refill bit buffer if running low
-                if (bitsAvailable <= 16) {
-                    uint32_t newBits = (dataPtr[1] << 8) | dataPtr[0];
-                    bitBuffer |= newBits << bitsAvailable;
-                    dataPtr += 2;
-                    bitsAvailable += 16;
-                }
-            }
-
-            // Store decompressed value with frame stride
-            *frameOutput = value;
-            frameOutput += frameOffset;
-
-            // Advance control pointer every second channel
-            if (channel & 1) {
-                controlPtr++;
-            }
-        }
-
-        // Move to next frame's base output position
-        outputBuffer++;
-    }
-
-    return bitsAvailable;
-}
-
 
 const uint8_t* ANIM_CODEC::VBRDecompressor::UnPackHeaderBits(DataPerDecompress* pWorkBuffer) {
     // mhdr is a direct pointer to the on-disk VBRDataHeaderValue (16-byte
@@ -2370,17 +1995,6 @@ void Andale::ExtractPackedNVBR(ExtractType* extractBuffer, uint32_t extractBuffS
 
 void Andale::Scalar_ExtractPackedNVBR(ExtractType* extractBuffer, uint32_t extractBuffSize, ANIM_CODEC::VBRDecompressor* decompressor)
 {
-    // Toggle to true to log entry / per-part header info when debugging the
-    // extraction pipeline. Off by default so normal CSV runs aren't noisy.
-    constexpr bool kExtractVerbose = false;
-    if (kExtractVerbose) {
-        static int s_calls = 0;
-        if (s_calls < 3) {
-            std::cerr << "[Scalar_ExtractPackedNVBR] entry, extractBuffSize=" << extractBuffSize
-                      << " decompressor=0x" << std::hex << (uintptr_t)decompressor << std::dec << "\n";
-            s_calls++;
-        }
-    }
     if (extractBuffSize == 0) {
         return;
     }
@@ -2391,19 +2005,6 @@ void Andale::Scalar_ExtractPackedNVBR(ExtractType* extractBuffer, uint32_t extra
         ExtractType& extract = extractBuffer[i];
 
         AnimationPart* part = reinterpret_cast<AnimationPart*>(extract.header);
-        if (kExtractVerbose) {
-            static int s_iTrace = 0;
-            if (s_iTrace < 4) {
-                std::cerr << "  [Scalar_ExtractPackedNVBR loop] i=" << i
-                          << " header=0x" << std::hex << (uintptr_t)extract.header
-                          << " sqtBuff=0x" << (uintptr_t)extract.sqtBuff << std::dec
-                          << " data[0]=" << extract.data[0]
-                          << " data[1]=" << extract.data[1]
-                          << " channelAnim=" << extract.channelAnim
-                          << " totalBones=" << extract.totalBones << "\n";
-                s_iTrace++;
-            }
-        }
         if (!part) continue;
 
         // All offset/header fields in AnimationPart are stored big-endian in
@@ -2511,30 +2112,132 @@ void Andale::Scalar_ExtractPackedNVBR(ExtractType* extractBuffer, uint32_t extra
     }
 }
 
+// One-shot diagnostic: dump the skeleton's per-part record table (boneID /
+// sqtOffset / totalBoneCount) alongside the clip/pose parts table (partID /
+// partOffset), so we can confirm whether the loaded skeleton's boneIDs
+// actually overlap the animation's partIDs. If they do, skeleton-aware bone
+// indexing is viable; if not, the loaded skeleton is the wrong rig.
+//
+// Skeleton (Andale::HierarchyData) layout, all multi-byte fields big-endian:
+//   +0  u16 mNbBones (N)
+//   +4  u32 mNbParts (P)
+//   +8  u32 mParents[N]
+//   per-part record table: base = (u8*)skel + 32 + 8*N, stride 36, P records:
+//     +0  u32 totalBoneCount
+//     +4  s32 sqtOffset       (SQTData bone index this part writes to)
+//     +10 u16 boneID          (matched against animation partID = entry>>24)
+static void DumpSkeletonVsClipIDs(const Andale::HierarchyData* skel,
+                                  const Andale::DataHeader* hdr,
+                                  bool isPose)
+{
+    if (!skel || !hdr) {
+        std::cerr << "[idcheck] skeleton or header is null (skel="
+                  << (const void*)skel << " hdr=" << (const void*)hdr << ")\n";
+        return;
+    }
+
+    const uint16_t N = Convert(skel->mNbBones);
+    const uint32_t P = Convert(skel->mNbParts);
+    const uint8_t* recBase =
+        reinterpret_cast<const uint8_t*>(skel) + 32 + 8u * (uint32_t)N;
+
+    std::cerr << "[idcheck] skeleton: mNbBones=" << N
+              << " mNbParts=" << P << "\n";
+    std::cerr << "[idcheck] skeleton parts  (idx: boneID sqtOffset totalBoneCount):\n";
+    std::vector<uint16_t> skelBoneIDs;
+    for (uint32_t p = 0; p < P && p < 128; ++p) {
+        const uint8_t* rec = recBase + (size_t)p * 36u;
+        uint32_t total   = Convert(*reinterpret_cast<const uint32_t*>(rec + 0));
+        int32_t  sqtOff  = (int32_t)Convert(*reinterpret_cast<const uint32_t*>(rec + 4));
+        uint16_t boneID  = Convert(*reinterpret_cast<const uint16_t*>(rec + 10));
+        skelBoneIDs.push_back(boneID);
+        std::cerr << "  [" << p << "] boneID=" << boneID
+                  << " sqtOffset=" << sqtOff
+                  << " totalBoneCount=" << total << "\n";
+    }
+
+    const uint32_t* alignedData = reinterpret_cast<const uint32_t*>(
+        (reinterpret_cast<uintptr_t>(&hdr[1].mGUID) + 3) & ~uintptr_t(0xF));
+    const uint32_t* partsTable = isPose
+        ? &alignedData[1]
+        : &reinterpret_cast<const Andale::AnimationData*>(alignedData)->mPartsOffsets[0];
+    const uint32_t poseTotal = isPose ? Convert(alignedData[0]) : 0u;
+
+    std::cerr << "[idcheck] " << (isPose ? "pose" : "clip")
+              << " parts (idx: partID partOffset):\n";
+    int matches = 0, totalListed = 0;
+    for (uint32_t i = 0; i < 128; ++i) {
+        uint32_t entry = Convert(partsTable[i]);
+        uint32_t off   = entry & 0xFFFFFFu;
+        uint32_t pid   = entry >> 24;
+        if (off == 0) break;
+        bool hit = false;
+        for (uint16_t b : skelBoneIDs) if (b == pid) { hit = true; break; }
+        if (hit) ++matches;
+        ++totalListed;
+        std::cerr << "  [" << i << "] partID=" << pid
+                  << " partOffset=0x" << std::hex << off << std::dec
+                  << (hit ? "  <-- matches a skeleton boneID" : "  (no skel match)")
+                  << "\n";
+        if (isPose && poseTotal && i + 1 >= poseTotal) break;
+    }
+    std::cerr << "[idcheck] " << matches << " / " << totalListed
+              << " animation parts matched a skeleton boneID\n";
+}
+
 uint32_t Andale::ExtractAllVBRParts(const DataHeader* hdr,
                                     uint32_t frameIndex,
                                     ANIM_CODEC::VBRDecompressor* decompressor,
                                     SQTData* sqtBuffer,
-                                    uint32_t maxBones)
+                                    uint32_t maxBones,
+                                    bool isPose,
+                                    const HierarchyData* skel)
 {
     if (!hdr || !decompressor || !sqtBuffer || maxBones == 0) return 0;
 
     const uint32_t* alignedData = reinterpret_cast<const uint32_t*>(
         (reinterpret_cast<uintptr_t>(&hdr[1].mGUID) + 3) & ~uintptr_t(0xF));
-    const AnimationData* animData = reinterpret_cast<const AnimationData*>(alignedData);
 
-    uint32_t bonesWritten = 0;
+    // Poses: parts table starts at alignedData+4 (after totalParts u32).
+    // Clips: parts table starts at alignedData+52 (after AnimationData header).
+    const uint32_t* partsTable = isPose
+        ? &alignedData[1]
+        : &reinterpret_cast<const AnimationData*>(alignedData)->mPartsOffsets[0];
 
-    // The on-disk parts table is contiguous and entries that aren't real have
-    // an offset of 0 (or an offset that points back at the header itself).
-    // We scan a generous upper bound and stop on a clearly-invalid entry.
+    // Skeleton per-part record table (all fields big-endian):
+    //   base = (u8*)skel + 32 + 8*mNbBones, stride 36, mNbParts records:
+    //     +0  u32 totalBoneCount
+    //     +4  s32 sqtOffset      (SQTData index this part's bones go to)
+    //     +10 u16 boneID         (unused here -- VBR partID is always 0)
+    // The i-th VBR part maps positionally to the i-th skeleton part.
+    uint32_t       skelPartCount = 0;
+    const uint8_t* skelRecBase   = nullptr;
+    if (skel) {
+        uint16_t skelNbBones = Convert(skel->mNbBones);
+        skelPartCount = Convert(skel->mNbParts);
+        skelRecBase = reinterpret_cast<const uint8_t*>(skel)
+                      + 32 + 8u * static_cast<uint32_t>(skelNbBones);
+    }
+    auto skelSqtOffset = [&](uint32_t p) -> int32_t {
+        return static_cast<int32_t>(Convert(*reinterpret_cast<const uint32_t*>(
+            skelRecBase + static_cast<size_t>(p) * 36u + 4u)));
+    };
+
+    // Identity-fill the whole output up front so any bone a part doesn't write
+    // reads as a valid rest pose, not garbage / zero quats. Matches the recomp
+    // (Vector_ExtractPackedNVBR zero-fills the buffer before decoding).
+    for (uint32_t b = 0; b < maxBones; ++b) {
+        sqtBuffer[b].mScale = rw::math::vpu::Vector3{ 1.0f, 1.0f, 1.0f };
+        sqtBuffer[b].mQuat  = rw::math::vpu::Quaternion{ 0.0f, 0.0f, 0.0f, 1.0f };
+        sqtBuffer[b].mTrans = rw::math::vpu::Vector4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    }
+
+    uint32_t bonesWritten  = 0;  // fallback contiguous cursor (skel == null)
+    uint32_t maxBoneIndex  = 0;  // return value: highest slot touched
     constexpr uint32_t kMaxPartsScan = 64;
 
-    for (uint32_t i = 0; i < kMaxPartsScan && bonesWritten < maxBones; ++i) {
-        // Each entry is BE-stored: high byte = partID, low 24 bits = animPart
-        // offset relative to alignedData. We don't care about partID here --
-        // skeleton-free extraction means we take every part with a valid offset.
-        uint32_t entry = Convert(animData->mPartsOffsets[i]);
+    for (uint32_t i = 0; i < kMaxPartsScan; ++i) {
+        uint32_t entry = Convert(partsTable[i]);
         uint32_t partOff = entry & 0xFFFFFFu;
         if (partOff == 0) break;  // sentinel / end of table
 
@@ -2546,26 +2249,36 @@ uint32_t Andale::ExtractAllVBRParts(const DataHeader* hdr,
         uint32_t hdrWord = Convert(part->mHeader);
         if ((hdrWord & 0xFFFFF000u) == 0) break;
 
-        // Set up an extract that points at *this* part with the output slice
-        // starting at sqtBuffer[bonesWritten].
+        // Where do this part's bones go? Prefer the skeleton's sqtOffset for
+        // the positionally-matching part; fall back to contiguous stacking.
+        uint32_t placeIndex;
+        if (skelRecBase && i < skelPartCount) {
+            int32_t so = skelSqtOffset(i);
+            placeIndex = (so >= 0) ? static_cast<uint32_t>(so) : bonesWritten;
+        } else {
+            placeIndex = bonesWritten;
+        }
+        if (placeIndex >= maxBones) continue;
+
         ExtractType extract = {};
         extract.header     = reinterpret_cast<uint32_t>(part);
-        extract.sqtBuff    = reinterpret_cast<uint32_t>(sqtBuffer + bonesWritten);
-        extract.totalBones = static_cast<uint16_t>(maxBones - bonesWritten);
+        extract.sqtBuff    = reinterpret_cast<uint32_t>(sqtBuffer + placeIndex);
+        extract.totalBones = static_cast<uint16_t>(maxBones - placeIndex);
         extract.data[0]    = static_cast<uint16_t>(frameIndex);
         extract.data[1]    = static_cast<uint16_t>(frameIndex);
         extract.codecType  = static_cast<uint8_t>(codec_type::CONV_FORMAT);
         extract.deltaQ     = rw::math::vpu::Quaternion{ 0.0f, 0.0f, 0.0f, 1.0f };
         extract.deltaT[0]  = extract.deltaT[1] = extract.deltaT[2] = 0.0f;
 
-        // Decode this part. Existing Scalar_ExtractPackedNVBR handles
-        // InitPerAnim / DecompressFrame / per-frame-block advance / PutData.
+        // Decode this part. Scalar_ExtractPackedNVBR handles InitPerAnim /
+        // DecompressFrame / per-frame-block advance / PutData. The part decodes
+        // its own intrinsic bone count (from its channel-info table) and
+        // scatters into sqtBuffer starting at placeIndex.
         Scalar_ExtractPackedNVBR(&extract, 1, decompressor);
 
-        // Determine how many SQTs this part actually wrote so we can advance
-        // the cursor. Channel-info table sits at ptr2 + 48 (per ComputeVBRInline
-        // for typical pose layout) but the *actual* offset depends on
-        // paletteSize and mNumFrames. We re-derive it.
+        // Intrinsic bone count from the part's channel-info (max numEnt+numConst
+        // across channels) -- used to advance the fallback cursor and to report
+        // how far into the buffer we wrote.
         const uint8_t* basePtr = reinterpret_cast<const uint8_t*>(part);
         uint32_t hdrOff = Convert(*reinterpret_cast<const uint32_t*>(basePtr + 8));
         const uint8_t* ptr2 = basePtr + hdrOff;
@@ -2575,7 +2288,7 @@ uint32_t Andale::ExtractAllVBRParts(const DataHeader* hdr,
         ComputeVBRInline(ptr2, paletteBase, channelInfoBase);
 
         uint8_t numChannels = ptr2[12];
-        uint16_t partTotal = 0;  // bones written by this part = max(numEnt + numConst) per channel
+        uint16_t partTotal = 0;
         for (uint8_t ch = 0; ch < numChannels; ++ch) {
             const uint8_t* entryC = channelInfoBase + (uint32_t)ch * 16u;
             uint16_t numEnt   = Convert(*reinterpret_cast<const uint16_t*>(entryC + 0));
@@ -2583,12 +2296,13 @@ uint32_t Andale::ExtractAllVBRParts(const DataHeader* hdr,
             uint16_t total = static_cast<uint16_t>(numEnt + numConst);
             if (total > partTotal) partTotal = total;
         }
-        if (partTotal == 0) partTotal = 1;  // at least one bone landed via PutData
+        if (partTotal == 0) partTotal = 1;
 
-        bonesWritten += partTotal;
+        bonesWritten = placeIndex + partTotal;
+        if (bonesWritten > maxBoneIndex) maxBoneIndex = bonesWritten;
     }
 
-    return bonesWritten;
+    return std::min<uint32_t>(maxBoneIndex, maxBones);
 }
 
 void ANIM_CODEC::RawDiscretize::TransDecompress(const tTransCompressed& input, rw::math::vpu::Vector4& output, float range)
@@ -2737,29 +2451,37 @@ void Andale::ExtractPackedN(ExtractType* extractBuffer, uint32_t extractBufferSi
     for (uint32_t bufferIndex = 0; bufferIndex < extractBufferSize; ++bufferIndex) { //current bone group
         ExtractType& current = extractBuffer[bufferIndex];
 
+        SQTData* output = reinterpret_cast<SQTData*>(current.sqtBuff);
+
+        // Per the recomp (sk82_na_zd.xex.c:3427693): the skip-vs-decode test
+        // is on `header`, NOT the compression header's bone count. An extract
+        // with header == 0 is an unmatched bone group -- the original fills it
+        // with identity SQTs (scale (1,1,1), identity quat, zero trans) and
+        // moves on. We must guard this anyway: dereferencing a null animPart
+        // below would crash.
+        if (current.header == 0) {
+            if (output) {
+                for (uint32_t b = 0; b < current.totalBones; ++b) {
+                    output[b].mScale = rw::math::vpu::Vector3{ 1.0f, 1.0f, 1.0f };
+                    output[b].mQuat  = rw::math::vpu::Quaternion{ 0.0f, 0.0f, 0.0f, 1.0f };
+                    output[b].mTrans = rw::math::vpu::Vector4{ 0.0f, 0.0f, 0.0f, 0.0f };
+                }
+            }
+            continue;
+        }
+
         AnimationPart* animPart = reinterpret_cast<AnimationPart*>(current.header);
 
         uint32_t compressionHeader = Convert(animPart->mCompressionHeader);
         ANIM_CODEC::RawDiscretize::CompressionHeader* compHeader = reinterpret_cast<ANIM_CODEC::RawDiscretize::CompressionHeader*>(current.header + compressionHeader);
 
         uint16_t frameSize = Convert(compHeader->mFrameSize);
-        uint8_t bonesPerFrame = compHeader->mNbBonesM1;
         bool CompressedT = compHeader->mCompressedT;
         bool CompressedQ = compHeader->mCompressedQ;
 
         uint32_t channelCount = ((Convert(animPart->mHeader) >> 6) & 0x3F) + 1;
         uint8_t* basePtr = reinterpret_cast<uint8_t*>(current.header);
         uint8_t* compressedData = basePtr + Convert(animPart->mCompressedData);
-
-
-        SQTData* output = reinterpret_cast<SQTData*>(current.sqtBuff);
-
-        if (bonesPerFrame == 0) {
-            float fallbackW = current.channelAnim ? 0.0f : 1.0f;
-            rw::math::vpu::Quaternion identityQuat = { fallbackW, 0.0f, 0.0f, 0.0f };
-            StoreQuaternion(&output->mQuat, identityQuat);
-            continue;
-        }
 
         uint32_t* bitmask = reinterpret_cast<uint32_t*>(compHeader->mMask);
 
@@ -3990,1063 +3712,13 @@ extern "C" {
     }
 }
 
-//============================================================================
-// VBR ground-truth trace reader.
-//
-// Reads C:/Users/tuukk/Desktop/vbr_trace.bin (or arbitrary path) produced by
-// the rexglue project's VBR hooks and prints / diffs the recorded calls.
-//
-// Trace file format:
-//   header   : char[8] "VBRTRACE", u32 version=1
-//   per call : char[4] "REC0", u32 kind, u32 idx, u32 payloadSize, bytes payload
-// Kinds: 1=InitPerAnim 2=UnPackHeaderBits 3=Vector_UnPack 4=DecompressFrameBlock 5=DecompressFrame
-//============================================================================
-namespace vbr_compare {
-
-struct InitPerAnimPayload {
-    uint32_t this_ptr;
-    uint32_t compressedHeaderData;
-    uint32_t headerData;
-    uint32_t threadId;
-    uint32_t result;
-    uint32_t pad;
-    uint8_t  workBuffer_pre[64];
-    uint8_t  workBuffer_post[64];
-    uint8_t  mhdrWrapper_pre[24];
-    uint8_t  mhdrWrapper_post[24];
-    uint8_t  headerDump[256];
-    // Increased from 64 to 256: with mNumBitsOffset up to ~200 and
-    // boneCount*4 up to ~88 bytes, 64 was too small for the ctrl word
-    // region (e.g. mNumBitsOffset=45 + 11 bones needs 89 bytes).
-    uint8_t  cmpHdrDump[256];
-};
-struct UnPackHeaderBitsPayload {
-    uint32_t this_ptr;
-    uint32_t pWorkBuffer;
-    uint32_t result;
-    uint32_t pad;
-    uint8_t  workBuffer_pre[64];
-    uint8_t  workBuffer_post[64];
-    uint8_t  mhdrWrapper[24];
-    uint32_t mConstDataPtr;
-    uint32_t mIsConstantPtr;
-    uint32_t mCompressedHeaderDataPtr;
-    uint32_t pad2;
-    uint8_t  mCompressedHeaderDump[128];
-    uint8_t  mConstData_post[256];
-    uint8_t  mIsConstantChannel_post[64];
-};
-struct VectorUnPackPayload {
-    uint32_t this_ptr;
-    uint32_t pCompressedData;
-    uint32_t pWorkBuffer;
-    uint32_t frameinBlk;
-    uint32_t threadId;
-    uint32_t scratchPtr;
-    uint32_t normalizedPtr;
-    uint32_t pad;
-    uint8_t  workBuffer_pre[64];
-    uint8_t  workBuffer_post[64];
-    uint8_t  mhdrWrapper[24];
-    uint8_t  cmpDataDump[256];
-    uint8_t  uncompressedScratch_pre[1024];   // stale state from prior calls
-    uint8_t  uncompressedScratch_post[1024];
-    uint8_t  normalizedData_pre[1024];        // stale state from prior calls
-    uint8_t  normalizedData_post[1024];
-};
-struct DecompressFrameBlockPayload {
-    uint32_t this_ptr;
-    uint32_t frameinBlk;
-    uint32_t pWorkBuffer;
-    uint32_t threadId;
-    uint32_t scratchPtr;
-    uint32_t normalizedPtr;
-    uint8_t  workBuffer_pre[64];
-    uint8_t  mhdrWrapper[24];
-    uint8_t  uncompressedScratch_pre[1024];
-    uint8_t  normalizedData_post[1024];
-};
-struct DecompressFramePayload {
-    uint32_t this_ptr;
-    uint32_t compressedData;
-    uint32_t frame;
-    uint32_t putLoc;
-    uint32_t threadId;
-    uint32_t pad;
-    uint8_t  workBuffer_pre[64];
-    uint8_t  workBuffer_post[64];
-    uint8_t  mhdrWrapper[24];
-    uint8_t  cmpDataDump[256];
-    uint8_t  putLoc_pre[36 * 48];
-    uint8_t  putLoc_post[36 * 48];
-};
-
-static const char* kindName(uint32_t k) {
-    switch (k) {
-        case 1: return "InitPerAnim";
-        case 2: return "UnPackHeaderBits";
-        case 3: return "Vector_UnPack";
-        case 4: return "DecompressFrameBlock";
-        case 5: return "DecompressFrame";
-        default: return "?";
-    }
-}
-
-// Pretty-print a chunk of bytes, 16 per line, hex.
-static void dumpBytes(const char* label, const uint8_t* p, size_t n, size_t maxLines = 4) {
-    std::cout << "  " << label << ":";
-    size_t lines = (n + 15) / 16;
-    if (lines > maxLines) lines = maxLines;
-    for (size_t row = 0; row < lines; ++row) {
-        std::cout << "\n   ";
-        size_t base_off = row * 16;
-        for (size_t col = 0; col < 16 && base_off + col < n; ++col) {
-            std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0')
-                      << (int)p[base_off + col];
-        }
-    }
-    std::cout << std::dec << std::setfill(' ') << "\n";
-}
-
-// Big-endian -> host float (recomp memory is PPC-native BE; we run on x86 LE).
-static inline float beFloat(const uint8_t* p) {
-    uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                 ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-    float f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-static inline uint32_t beU32(const uint8_t* p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-}
-
-// Dump every DecompressFrame record's putLoc_post as a CSV file with one row
-// per (record, bone). Layout matches AnimTest's CSV writer so users can diff
-// directly against an AnimTest export.
-static int exportFramesCsv(const char* tracePath, const char* csvPath) {
-    std::ifstream in(tracePath, std::ios::binary);
-    if (!in) {
-        std::cout << "Cannot open " << tracePath << "\n";
-        return 1;
-    }
-    char magic[8];
-    in.read(magic, 8);
-    if (std::memcmp(magic, "VBRTRACE", 8) != 0) {
-        std::cout << "Not a VBRTRACE file\n";
-        return 1;
-    }
-    uint32_t version = 0;
-    in.read(reinterpret_cast<char*>(&version), 4);
-
-    std::ofstream out(csvPath);
-    if (!out) {
-        std::cout << "Cannot open " << csvPath << " for writing\n";
-        return 1;
-    }
-    out << "rec,frame,putLoc,bone,sx,sy,sz,sw,qx,qy,qz,qw,tx,ty,tz,tw\n";
-    out << std::fixed;
-    out.precision(6);
-
-    int written = 0;
-    while (in.peek() != EOF) {
-        char marker[4];
-        in.read(marker, 4);
-        if (in.gcount() != 4) break;
-        uint32_t kind = 0, idx = 0, sz = 0;
-        in.read(reinterpret_cast<char*>(&kind), 4);
-        in.read(reinterpret_cast<char*>(&idx),  4);
-        in.read(reinterpret_cast<char*>(&sz),   4);
-        std::vector<uint8_t> payload(sz);
-        in.read(reinterpret_cast<char*>(payload.data()), sz);
-        if (kind != 5 || sz < sizeof(DecompressFramePayload)) continue;
-
-        auto* p = reinterpret_cast<const DecompressFramePayload*>(payload.data());
-        // 36 bones x 48 bytes per SQTData.
-        for (int bone = 0; bone < 36; ++bone) {
-            const uint8_t* sqt = p->putLoc_post + bone * 48;
-            // Layout per SQTData: mScale Vector3 (16 bytes incl pad),
-            // mQuat Quaternion (16), mTrans Vector4 (16). Floats are BE.
-            float sx = beFloat(sqt + 0);
-            float sy = beFloat(sqt + 4);
-            float sz = beFloat(sqt + 8);
-            float sw = beFloat(sqt + 12);
-            float qx = beFloat(sqt + 16);
-            float qy = beFloat(sqt + 20);
-            float qz = beFloat(sqt + 24);
-            float qw = beFloat(sqt + 28);
-            float tx = beFloat(sqt + 32);
-            float ty = beFloat(sqt + 36);
-            float tz = beFloat(sqt + 40);
-            float tw = beFloat(sqt + 44);
-            out << idx << ',' << p->frame << ",0x" << std::hex << p->putLoc
-                << std::dec << ',' << bone
-                << ',' << sx << ',' << sy << ',' << sz << ',' << sw
-                << ',' << qx << ',' << qy << ',' << qz << ',' << qw
-                << ',' << tx << ',' << ty << ',' << tz << ',' << tw
-                << '\n';
-        }
-        written++;
-    }
-    std::cout << "Wrote " << csvPath << " (" << written << " DecompressFrame records, "
-              << (written * 36) << " rows)\n";
-    return 0;
-}
-
-// Per-record comparator: replays each trace record's inputs through AnimTest's
-// VBR decoder and reports divergences against the recomp's recorded outputs.
-//
-// Note: our decoder uses workBuffer.mhdr as a direct VBRDataHeaderValue ptr,
-// while the recomp uses a wrapper struct (mhdr -> { mData, mPalette, mChInfo,
-// mFrameBlockSizes, flag }). We can't byte-compare workBuffer.mhdr; instead we
-// compare the FUNCTIONAL outputs: mNumBitsOffset, mFrameOffset,
-// mNumConstantChannels, mChannelBlockStarts/Ends, mConstData[], and
-// mIsConstantChannel[].
-static int diff(const char* tracePath) {
-    std::ifstream in(tracePath, std::ios::binary);
-    if (!in) {
-        std::cout << "Cannot open " << tracePath << "\n";
-        return 1;
-    }
-    char magic[8];
-    in.read(magic, 8);
-    if (std::memcmp(magic, "VBRTRACE", 8) != 0) {
-        std::cout << "Not a VBRTRACE file\n";
-        return 1;
-    }
-    uint32_t version = 0;
-    in.read(reinterpret_cast<char*>(&version), 4);
-
-    // Build a fresh decompressor matching the game's setup: SQT layout
-    // (size 3, 4, 3 -- scale/quat/trans) at offsets 0/16/32 with stride 48.
-    // Allocate enough scratch for ~256 bones.
-    constexpr uint32_t kScratchBones = 256;
-    auto* dec = new ANIM_CODEC::VBRDecompressor();
-    dec->BeginAddingChannels();
-    dec->AddChannel(3u, 0, 0x00u, 0x30u);
-    dec->AddChannel(4u, 0, 0x10u, 0x30u);
-    dec->AddChannel(3u, 0, 0x20u, 0x30u);
-    dec->EndAddingChannels();
-    dec->Init(kScratchBones);
-
-    int recordsTotal = 0, recordsCompared = 0, recordsMatched = 0;
-    int firstMismatchPrinted = 0;
-
-    while (in.peek() != EOF) {
-        char marker[4];
-        in.read(marker, 4);
-        if (in.gcount() != 4) break;
-        uint32_t kind = 0, idx = 0, sz = 0;
-        in.read(reinterpret_cast<char*>(&kind), 4);
-        in.read(reinterpret_cast<char*>(&idx),  4);
-        in.read(reinterpret_cast<char*>(&sz),   4);
-        std::vector<uint8_t> payload(sz);
-        in.read(reinterpret_cast<char*>(payload.data()), sz);
-        recordsTotal++;
-        if (kind != 1 || sz < sizeof(InitPerAnimPayload)) continue;
-
-        auto* p = reinterpret_cast<const InitPerAnimPayload*>(payload.data());
-        recordsCompared++;
-
-        // Replay: copy the recorded headerData bytes (256) and cmpHdrDump
-        // bytes (256) into local buffers and run our InitPerAnim against them.
-        // We use threadId 0 regardless of the recorded threadId since each
-        // call starts from a clean workBuffer.
-        alignas(16) uint8_t localHeader[256];
-        std::memcpy(localHeader, p->headerDump, sizeof(localHeader));
-
-        // Allocate enough room for the 256-byte cmpHdrDump.  UnPackHeaderBits
-        // can read past it if mConstChanMapSize is very large; beyond that we
-        // read zeros -- acceptable for short clips.
-        alignas(16) uint8_t localCmpHdr[256] = {};
-        std::memcpy(localCmpHdr, p->cmpHdrDump, sizeof(p->cmpHdrDump));
-
-        uint32_t ourResult = dec->InitPerAnim(localCmpHdr, localHeader, 0);
-
-        // Read recomp's expected outputs (BE-stored u32s in workBuffer_post).
-        // Layout offsets we care about (per recomp's PPC struct):
-        //   +16  mNumBitsOffset
-        //   +40  mNumConstantChannels
-        //   +44  mFrameOffset
-        //   +48..55 mChannelBlockStarts[4]  (u16 BE each)
-        //   +56..63 mChannelBlockEnds[4]    (u16 BE each)
-        uint32_t expNumBitsOffset       = beU32(p->workBuffer_post + 16);
-        uint32_t expNumConstantChannels = beU32(p->workBuffer_post + 40);
-        uint32_t expFrameOffset         = beU32(p->workBuffer_post + 44);
-        uint16_t expStarts[4];
-        uint16_t expEnds[4];
-        for (int k = 0; k < 4; ++k) {
-            expStarts[k] = ((uint16_t)p->workBuffer_post[48 + k*2] << 8)
-                         |  (uint16_t)p->workBuffer_post[48 + k*2 + 1];
-            expEnds[k]   = ((uint16_t)p->workBuffer_post[56 + k*2] << 8)
-                         |  (uint16_t)p->workBuffer_post[56 + k*2 + 1];
-        }
-
-        ANIM_CODEC::DataPerDecompress& wb = dec->mWorkBuffers[0];
-
-        bool mismatch = false;
-        if (wb.mNumBitsOffset != expNumBitsOffset)             mismatch = true;
-        if (wb.mNumConstantChannels != expNumConstantChannels) mismatch = true;
-        if (wb.mFrameOffset != expFrameOffset)                 mismatch = true;
-        for (int k = 0; k < 4; ++k) {
-            if (wb.mChannelBlockStarts[k] != expStarts[k]) mismatch = true;
-            if (wb.mChannelBlockEnds[k]   != expEnds[k])   mismatch = true;
-        }
-
-        // (mConstData diff happens in the UnPackHeaderBits comparator -- the
-        // InitPerAnim payload doesn't carry the decoded const buffer; only the
-        // workBuffer fields it writes are checked here.)
-
-        if (!mismatch) {
-            recordsMatched++;
-            continue;
-        }
-        if (firstMismatchPrinted >= 5) continue;
-        firstMismatchPrinted++;
-
-        std::cout << "\n[#" << idx << "] InitPerAnim DIVERGES\n";
-        std::cout << "  hdr=0x" << std::hex << p->headerData
-                  << " cmpHdr=0x" << p->compressedHeaderData
-                  << " tid=" << std::dec << p->threadId
-                  << " (replayed at threadId=0)\n";
-        std::cout << "  field           recomp        ours\n";
-        std::cout << "  mNumBitsOffset  " << expNumBitsOffset
-                  << "             " << wb.mNumBitsOffset
-                  << ((wb.mNumBitsOffset == expNumBitsOffset) ? " ✓" : " ✗") << "\n";
-        std::cout << "  mNumConstantCh  " << expNumConstantChannels
-                  << "             " << wb.mNumConstantChannels
-                  << ((wb.mNumConstantChannels == expNumConstantChannels) ? " ✓" : " ✗") << "\n";
-        std::cout << "  mFrameOffset    " << expFrameOffset
-                  << "             " << wb.mFrameOffset
-                  << ((wb.mFrameOffset == expFrameOffset) ? " ✓" : " ✗") << "\n";
-        for (int k = 0; k < 4; ++k) {
-            std::cout << "  blockStart[" << k << "]   " << expStarts[k]
-                      << "            " << wb.mChannelBlockStarts[k]
-                      << ((wb.mChannelBlockStarts[k] == expStarts[k]) ? " ✓" : " ✗") << "\n";
-        }
-        for (int k = 0; k < 4; ++k) {
-            std::cout << "  blockEnd[" << k << "]     " << expEnds[k]
-                      << "            " << wb.mChannelBlockEnds[k]
-                      << ((wb.mChannelBlockEnds[k] == expEnds[k]) ? " ✓" : " ✗") << "\n";
-        }
-    }
-
-    std::cout << "\n=== InitPerAnim diff summary ===\n";
-    std::cout << "  total records  : " << recordsTotal    << "\n";
-    std::cout << "  InitPerAnim    : " << recordsCompared << "\n";
-    std::cout << "  matched        : " << recordsMatched  << "\n";
-    std::cout << "  diverged       : " << (recordsCompared - recordsMatched) << "\n";
-
-    // ------------------------------------------------------------------
-    // Pass 2: UnPackHeaderBits diff. Walks the trace again, replays each
-    // record's inputs, and compares mConstData / mIsConstantChannel /
-    // mNumBitsOffset (return value).
-    // ------------------------------------------------------------------
-    in.clear();
-    in.seekg(12);  // skip header
-    int upRecords = 0, upMatched = 0, upPrinted = 0;
-    int constMismatchCount = 0, isConstMismatchCount = 0, resultMismatchCount = 0;
-
-    while (in.peek() != EOF) {
-        char marker[4];
-        in.read(marker, 4);
-        if (in.gcount() != 4) break;
-        uint32_t kind = 0, idx = 0, sz = 0;
-        in.read(reinterpret_cast<char*>(&kind), 4);
-        in.read(reinterpret_cast<char*>(&idx),  4);
-        in.read(reinterpret_cast<char*>(&sz),   4);
-        std::vector<uint8_t> payload(sz);
-        in.read(reinterpret_cast<char*>(payload.data()), sz);
-        if (kind != 2 || sz < sizeof(UnPackHeaderBitsPayload)) continue;
-        upRecords++;
-
-        auto* p = reinterpret_cast<const UnPackHeaderBitsPayload*>(payload.data());
-
-        // Reconstruct the inputs UnPackHeaderBits saw:
-        //   - workBuffer.mhdr -> wrapper struct -> headerData (from
-        //     mhdrWrapper field0 = headerData ptr; we already have those
-        //     bytes via the InitPerAnim record by index, but UnPackHeaderBits
-        //     itself doesn't carry them. Instead we can derive: in our
-        //     simplified scheme mhdr IS the VBRDataHeaderValue ptr, so we
-        //     need to materialize the headerData bytes the wrapper points at.
-        //     We don't have those in this record -- BUT we have the same
-        //     palette/channelInfo data accessible via the workBuffer_pre's
-        //     mhdr wrapper which lives in foreign memory. To keep the
-        //     comparator self-contained we re-run InitPerAnim from the
-        //     PAIRED InitPerAnim record (index = idx + 1 in the trace).
-        //
-        //   - mCompressedHeaderData bytes (the immutable input we DO have).
-        //
-        // Strategy: skip records where we can't pair to an InitPerAnim. For
-        // this trace pattern (UnPackHeaderBits at record idx, paired
-        // InitPerAnim at idx+1), we do a sidecar lookup.
-
-        // --- find paired InitPerAnim (the very next record by index) ---
-        std::streampos savedPos = in.tellg();
-        // The paired InitPerAnim follows immediately; peek next record.
-        char m2[4]; uint32_t k2 = 0, i2 = 0, s2 = 0;
-        in.read(m2, 4);
-        in.read(reinterpret_cast<char*>(&k2), 4);
-        in.read(reinterpret_cast<char*>(&i2), 4);
-        in.read(reinterpret_cast<char*>(&s2), 4);
-        if (std::memcmp(m2, "REC0", 4) != 0 || k2 != 1 || s2 < sizeof(InitPerAnimPayload)) {
-            // Not paired -- restore and skip.
-            in.clear();
-            in.seekg(savedPos);
-            continue;
-        }
-        std::vector<uint8_t> ipPayload(s2);
-        in.read(reinterpret_cast<char*>(ipPayload.data()), s2);
-        auto* ip = reinterpret_cast<const InitPerAnimPayload*>(ipPayload.data());
-
-        // Now we have headerDump from the paired InitPerAnim. Replay:
-        alignas(16) uint8_t localHeader[256];
-        std::memcpy(localHeader, ip->headerDump, sizeof(localHeader));
-        alignas(16) uint8_t localCmpHdr[256] = {};
-        std::memcpy(localCmpHdr, p->mCompressedHeaderDump, sizeof(p->mCompressedHeaderDump));
-
-        uint32_t ourResult = dec->InitPerAnim(localCmpHdr, localHeader, 0);
-
-        ANIM_CODEC::DataPerDecompress& wb = dec->mWorkBuffers[0];
-
-        // Compare result (= mNumBitsOffset + mFrameOffset*4).
-        bool resultOK = (ourResult == p->result);
-        if (!resultOK) resultMismatchCount++;
-
-        // Compute the ACTUALLY-WRITTEN ranges -- both decoders leave memory
-        // past these untouched, so any diff there reflects unrelated heap
-        // state from prior calls and is not a real bug.
-
-        const uint8_t* hdr = ip->headerDump;
-        uint16_t hdr_mConstChanMapSize = ((uint16_t)hdr[0] << 8) | hdr[1];
-        uint8_t  hdr_mNumChannels      = hdr[12];
-        uint8_t  hdr_mPaletteSize      = hdr[13];
-
-        // mConstData valid count = sum(size*numConst) across channels.
-        uint32_t constFloatsWritten = 0;
-        // mIsConstantChannel valid count = sum of run-counts in cmpHdr.
-        uint32_t icBytesWritten = 0;
-        {
-            // Re-derive channelInfoBase the same way ComputeVBRInline does
-            // (palette + frame-map area, aligned to 16).
-            uint16_t nf = ((uint16_t)hdr[2] << 8) | hdr[3];
-            uint32_t mapBytes = 2u * ((nf + 7u) / 8u);
-            uintptr_t alignedRaw = (16u + 4u*hdr_mPaletteSize + mapBytes + 0xFu)
-                                   & ~uintptr_t(0xF);
-            for (uint8_t ch = 0; ch < hdr_mNumChannels; ++ch) {
-                const uint8_t* entry = hdr + alignedRaw + (uint32_t)ch * 16u;
-                uint16_t numConst = ((uint16_t)entry[2] << 8) | entry[3];
-                uint8_t  size     = entry[12];
-                constFloatsWritten += (uint32_t)size * numConst;
-            }
-            // Run-bytes start where palette indices end (which equals
-            // constFloatsWritten -- one byte per palette index).
-            uint32_t runStart = constFloatsWritten;
-            for (uint16_t k = 0; k < hdr_mConstChanMapSize; ++k) {
-                if (runStart + k >= sizeof(p->mCompressedHeaderDump)) break;
-                icBytesWritten += p->mCompressedHeaderDump[runStart + k];
-            }
-        }
-
-        // Compare mConstData ONLY in the written range.
-        bool constOK = true;
-        int firstConstDiff = -1;
-        uint32_t cLimit = constFloatsWritten;
-        if (cLimit > 64) cLimit = 64;
-        for (uint32_t i = 0; i < cLimit; ++i) {
-            float exp = beFloat(p->mConstData_post + i * 4);
-            float ours = wb.mConstData[i];
-            uint32_t expU, oursU;
-            std::memcpy(&expU,  &exp,  4);
-            std::memcpy(&oursU, &ours, 4);
-            if (expU != oursU) {
-                constOK = false;
-                if (firstConstDiff < 0) firstConstDiff = (int)i;
-            }
-        }
-        if (!constOK) constMismatchCount++;
-
-        // Compare mIsConstantChannel ONLY in the written range.
-        const uint8_t* ourIc = reinterpret_cast<const uint8_t*>(wb.mIsConstantChannel);
-        uint32_t icLimit = icBytesWritten;
-        if (icLimit > 64) icLimit = 64;
-        bool icMeaningfulOK = true;
-        int firstIcDiff = -1;
-        for (uint32_t i = 0; i < icLimit; ++i) {
-            if (ourIc[i] != p->mIsConstantChannel_post[i]) {
-                icMeaningfulOK = false;
-                if (firstIcDiff < 0) firstIcDiff = (int)i;
-                break;
-            }
-        }
-        if (!icMeaningfulOK) isConstMismatchCount++;
-
-        bool allOK = resultOK && constOK && icMeaningfulOK;
-        if (allOK) { upMatched++; continue; }
-        if (upPrinted >= 5) continue;
-        upPrinted++;
-
-        std::cout << "\n[#" << idx << "] UnPackHeaderBits DIVERGES";
-        if (!resultOK)         std::cout << " [result]";
-        if (!constOK)          std::cout << " [mConstData]";
-        if (!icMeaningfulOK)   std::cout << " [mIsConstantChannel]";
-        std::cout << "\n  result: recomp=" << p->result
-                  << " ours=" << ourResult
-                  << ((resultOK) ? " ✓" : " ✗") << "\n";
-        if (!constOK) {
-            std::cout << "  mConstData first diff at index " << firstConstDiff << ":\n";
-            std::cout << "    recomp:";
-            for (int i = firstConstDiff; i < firstConstDiff + 8 && i < 64; ++i) {
-                std::cout << ' ' << beFloat(p->mConstData_post + i * 4);
-            }
-            std::cout << "\n    ours  :";
-            for (int i = firstConstDiff; i < firstConstDiff + 8 && i < 64; ++i) {
-                std::cout << ' ' << wb.mConstData[i];
-            }
-            std::cout << "\n";
-        }
-        if (!icMeaningfulOK) {
-            std::cout << "  mIsConstantChannel diff (limit=" << icLimit
-                      << ", first diff=" << firstIcDiff << "):\n";
-            std::cout << "    recomp:";
-            for (uint32_t i = 0; i < icLimit && i < 32; ++i)
-                std::cout << ' ' << (int)p->mIsConstantChannel_post[i];
-            std::cout << "\n    ours  :";
-            for (uint32_t i = 0; i < icLimit && i < 32; ++i)
-                std::cout << ' ' << (int)ourIc[i];
-            std::cout << "\n";
-            // Dump key inputs so we can see if our channel-info / map-size
-            // reading matches the file.
-            const uint8_t* hdr = ip->headerDump;
-            uint16_t hdr_mConstChanMapSize = ((uint16_t)hdr[0] << 8) | hdr[1];
-            uint16_t hdr_mNumFrames        = ((uint16_t)hdr[2] << 8) | hdr[3];
-            uint8_t  hdr_mNumChannels      = hdr[12];
-            uint8_t  hdr_mPaletteSize      = hdr[13];
-            std::cout << "  hdr[0..15]:";
-            for (int b = 0; b < 16; ++b)
-                std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0') << (int)hdr[b];
-            std::cout << std::dec << std::setfill(' ')
-                      << "    (mConstChanMapSize=" << hdr_mConstChanMapSize
-                      << " mNumFrames=" << hdr_mNumFrames
-                      << " mNumChannels=" << (int)hdr_mNumChannels
-                      << " mPaletteSize=" << (int)hdr_mPaletteSize << ")\n";
-            std::cout << "  cmpHdr[0..31]:";
-            for (int b = 0; b < 32; ++b)
-                std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0')
-                          << (int)p->mCompressedHeaderDump[b];
-            std::cout << std::dec << std::setfill(' ') << "\n";
-            // Print our-side's interpretation of where palette ends + run bytes start.
-            uint32_t paletteIdxBytes = 0;
-            for (uint8_t ch = 0; ch < hdr_mNumChannels; ++ch) {
-                // ChannelInfo table starts after VBRDataHeaderValue+palette+frame-map
-                // (aligned to 16). Re-derive same way as ComputeVBRInline.
-                uint8_t  ps = hdr[13];
-                uint16_t nf = ((uint16_t)hdr[2] << 8) | hdr[3];
-                uint32_t mapBytes = 2u * ((nf + 7u) / 8u);
-                uintptr_t alignedRaw = (16u + 4u*ps + mapBytes + 0xFu) & ~uintptr_t(0xF);
-                const uint8_t* entry = hdr + alignedRaw + (uint32_t)ch * 16u;
-                uint16_t numConst = ((uint16_t)entry[2] << 8) | entry[3];
-                uint8_t  size     = entry[12];
-                paletteIdxBytes += (uint32_t)size * numConst;
-            }
-            std::cout << "  expected palette-indices=" << paletteIdxBytes
-                      << " run-bytes-start=" << paletteIdxBytes
-                      << " run-bytes:";
-            for (uint32_t k = 0; k < hdr_mConstChanMapSize && paletteIdxBytes + k < 128; ++k) {
-                std::cout << ' ' << (int)p->mCompressedHeaderDump[paletteIdxBytes + k];
-            }
-            std::cout << "\n";
-        }
-    }
-
-    std::cout << "\n=== UnPackHeaderBits diff summary ===\n";
-    std::cout << "  records             : " << upRecords  << "\n";
-    std::cout << "  matched             : " << upMatched  << "\n";
-    std::cout << "  result mismatches   : " << resultMismatchCount << "\n";
-    std::cout << "  mConstData mismatches: " << constMismatchCount << "\n";
-    std::cout << "  mIsConst mismatches : " << isConstMismatchCount << "\n";
-
-    // ------------------------------------------------------------------
-    // Pass 3: Vector_UnPack diff.
-    // ------------------------------------------------------------------
-    std::cout << "\n[Vector_UnPack diff] starting pass 3...\n";
-    std::cout.flush();
-    in.clear();
-    in.seekg(12);
-    struct RecordRef { uint32_t kind; std::streampos pos; uint32_t size; };
-    std::vector<RecordRef> recIndex;
-    while (in.peek() != EOF) {
-        std::streampos recStart = in.tellg();
-        char m[4];
-        in.read(m, 4);
-        if (in.gcount() != 4) break;
-        uint32_t k = 0, i = 0, s = 0;
-        in.read(reinterpret_cast<char*>(&k), 4);
-        in.read(reinterpret_cast<char*>(&i), 4);
-        in.read(reinterpret_cast<char*>(&s), 4);
-        recIndex.push_back({k, recStart, s});
-        in.seekg(s, std::ios::cur);
-    }
-
-    auto loadRecord = [&](size_t idx, std::vector<uint8_t>& out) -> bool {
-        if (idx >= recIndex.size()) return false;
-        in.clear();
-        in.seekg(recIndex[idx].pos);
-        // Skip the 16-byte record header (REC0/kind/idx/size).
-        in.seekg(16, std::ios::cur);
-        out.resize(recIndex[idx].size);
-        in.read(reinterpret_cast<char*>(out.data()), recIndex[idx].size);
-        return true;
-    };
-
-    int vupRecords = 0, vupMatched = 0, vupPrinted = 0;
-    int vupScratchMismatches = 0, vupNormMismatches = 0;
-
-    int vupAnimated = 0;  // count records where mFrameOffset > 0 (bit decoder fired)
-
-    // Helper: read the leading u32 (`this_ptr`) of a record's payload, since
-    // both InitPerAnim and Vector_UnPack put it as their first field.
-    auto readThisPtr = [&](size_t idx) -> uint32_t {
-        in.clear();
-        in.seekg(recIndex[idx].pos);
-        in.seekg(16, std::ios::cur);   // skip REC0/kind/idx/size header
-        uint32_t v = 0;
-        in.read(reinterpret_cast<char*>(&v), 4);
-        return v;
-    };
-
-    for (size_t recIdx = 0; recIdx < recIndex.size(); ++recIdx) {
-        if (recIndex[recIdx].kind != 3) continue;
-        // Find paired InitPerAnim: most recent kind=1 record before this one
-        // **whose this_ptr matches**. Multiple decompressor instances may be
-        // interleaved, so picking purely by recency would mis-pair clips.
-        uint32_t targetThis = readThisPtr(recIdx);
-        size_t pairedIp = (size_t)-1;
-        for (size_t j = recIdx; j-- > 0;) {
-            if (recIndex[j].kind == 1 && readThisPtr(j) == targetThis) {
-                pairedIp = j;
-                break;
-            }
-        }
-        if (pairedIp == (size_t)-1) continue;
-
-        std::vector<uint8_t> vupBuf, ipBuf;
-        if (!loadRecord(recIdx,   vupBuf)) continue;
-        if (!loadRecord(pairedIp, ipBuf))  continue;
-        if (vupBuf.size() < sizeof(VectorUnPackPayload)) continue;
-        if (ipBuf.size()  < sizeof(InitPerAnimPayload))  continue;
-
-        auto* p  = reinterpret_cast<const VectorUnPackPayload*>(vupBuf.data());
-        auto* ip = reinterpret_cast<const InitPerAnimPayload*>(ipBuf.data());
-        vupRecords++;
-
-        // Re-init our decoder against this clip. Use static large buffers
-        // (zero-padded) so the control-nibble stream read past the captured
-        // 256-byte cmpHdrDump returns 0 instead of crashing.
-        alignas(16) static uint8_t localHeader[1024];
-        alignas(16) static uint8_t localCmpHdr[8192];
-        std::memset(localHeader, 0, sizeof(localHeader));
-        std::memset(localCmpHdr, 0, sizeof(localCmpHdr));
-        std::memcpy(localHeader, ip->headerDump, sizeof(ip->headerDump));
-        std::memcpy(localCmpHdr, ip->cmpHdrDump, sizeof(ip->cmpHdrDump));
-        dec->InitPerAnim(localCmpHdr, localHeader, 0);
-
-        // Replay Vector_UnPack with the recorded compressedData bytes.
-        // Use a large zero-padded buffer so reads past the captured 256
-        // bytes don't crash; values won't match the recomp past that point
-        // but no segfault and the early bytes still diff meaningfully.
-        alignas(16) static uint8_t localCmpData[8192];
-        std::memset(localCmpData, 0, sizeof(localCmpData));
-        std::memcpy(localCmpData, p->cmpDataDump, sizeof(p->cmpDataDump));
-
-        ANIM_CODEC::DataPerDecompress& wb = dec->mWorkBuffers[0];
-        // Vector_UnPack -> DecompressFrameBlock reads workBuffer.mCompressedData
-        // for its channel-index prefix loop. The recomp's DecompressFrame sets
-        // that field before calling Vector_UnPack; our replay bypasses
-        // DecompressFrame, so we provide a small zero-filled stand-in. The
-        // first N bytes (= numChannels channel indices) read as 0 -- not the
-        // game's real channel-index mapping, but the bit-decoder output we
-        // care about doesn't depend on it.
-        static uint8_t s_dummyCmpData[64] = {0};
-        wb.mCompressedData = s_dummyCmpData;
-
-        // Seed scratch + normalized buffers from the captured pre-state so
-        // we faithfully reproduce the recomp's stateful behavior across calls.
-        // The recomp doesn't zero these between Vector_UnPack invocations;
-        // when mFrameOffset==0 the bit decoder is skipped entirely and any
-        // stale values from prior animated calls remain. Without this seed,
-        // mFrameOffset==0 records that read non-zero scratch in the recomp
-        // would diverge against our fresh-zero state.
-        if (wb.mUncompressedBlkDataScratch) {
-            for (int i = 0; i < 256; ++i) {
-                wb.mUncompressedBlkDataScratch[i] =
-                    (int32_t)beU32(p->uncompressedScratch_pre + i * 4);
-            }
-        }
-        if (wb.mNormalizedData) {
-            for (int i = 0; i < 256; ++i) {
-                wb.mNormalizedData[i] = beFloat(p->normalizedData_pre + i * 4);
-            }
-        }
-
-        // Vector_UnPack expects pCompressedData *already advanced* past the
-        // numChannels-byte channel-index prefix, so caller normally feeds
-        // `compressedData + numChannels`. Our trace captured that adjusted
-        // pointer; we mirror by simply passing localCmpData directly.
-        dec->Vector_UnPackFrameBlockAndDecompressOneFrame(
-            localCmpData, &wb,
-            (uint8_t)(p->frameinBlk & 0xFF),
-            0 /* threadId */);
-        if (wb.mFrameOffset > 0) vupAnimated++;
-
-        // Compare uncompressedScratch_post: 256 ints (1024 bytes), recomp
-        // bytes are BE u32s, ours are host-LE u32s.
-        bool scratchOK = true;
-        int firstScratchDiff = -1;
-        if (wb.mUncompressedBlkDataScratch) {
-            for (int i = 0; i < 256; ++i) {
-                int32_t exp = (int32_t)beU32(p->uncompressedScratch_post + i * 4);
-                int32_t ours = wb.mUncompressedBlkDataScratch[i];
-                if (exp != ours) {
-                    scratchOK = false;
-                    if (firstScratchDiff < 0) firstScratchDiff = i;
-                }
-            }
-        }
-        if (!scratchOK) vupScratchMismatches++;
-
-        // Compare normalizedData_post: 256 floats, recomp BE bit-patterns.
-        bool normOK = true;
-        int firstNormDiff = -1;
-        if (wb.mNormalizedData) {
-            for (int i = 0; i < 256; ++i) {
-                float exp = beFloat(p->normalizedData_post + i * 4);
-                float ours = wb.mNormalizedData[i];
-                uint32_t expU, oursU;
-                std::memcpy(&expU, &exp, 4);
-                std::memcpy(&oursU, &ours, 4);
-                if (expU != oursU) {
-                    normOK = false;
-                    if (firstNormDiff < 0) firstNormDiff = i;
-                }
-            }
-        }
-        if (!normOK) vupNormMismatches++;
-
-        if (scratchOK && normOK) { vupMatched++; continue; }
-        if (vupPrinted >= 3) continue;
-        vupPrinted++;
-
-        std::cout << "\n[#" << recIndex[recIdx].pos << "/rec" << recIdx
-                  << "] Vector_UnPack DIVERGES";
-        if (!scratchOK) std::cout << " [uncompressedScratch]";
-        if (!normOK)    std::cout << " [normalizedData]";
-        std::cout << "\n  inputs: pCmp=0x" << std::hex << p->pCompressedData
-                  << " pWB=0x" << p->pWorkBuffer
-                  << " frameinBlk=" << std::dec << p->frameinBlk
-                  << " mFrameOffset(ours)=" << wb.mFrameOffset << "\n";
-        // Dump the recomp's mhdrWrapper bytes (= 24 bytes at wrapper struct).
-        std::cout << "  mhdrWrapper[24] (recomp): " << std::hex << std::setfill('0');
-        for (int i = 0; i < 24; ++i) {
-            std::cout << ' ' << std::setw(2) << (unsigned)p->mhdrWrapper[i];
-        }
-        std::cout << std::setfill(' ') << std::dec << "\n";
-        // Print scratch_post side-by-side for recomp vs ours, slot 0..15.
-        // If diff says scratch matches but recomp's dot product behaves
-        // differently from ours, we need to verify the captured BYTES
-        // really are what we think they are.
-        std::cout << "  scratch[0..15] recomp(as int): ";
-        for (int i = 0; i < 16; ++i) {
-            int32_t exp = (int32_t)beU32(p->uncompressedScratch_post + i * 4);
-            std::cout << ' ' << exp;
-        }
-        std::cout << "\n  scratch[0..15] recomp(as flt): ";
-        for (int i = 0; i < 16; ++i) {
-            float f = beFloat(p->uncompressedScratch_post + i * 4);
-            std::cout << ' ' << f;
-        }
-        std::cout << "\n  scratch[0..15] ours  (as int): ";
-        if (wb.mUncompressedBlkDataScratch) {
-            for (int i = 0; i < 16; ++i) {
-                std::cout << ' ' << wb.mUncompressedBlkDataScratch[i];
-            }
-        }
-        std::cout << "\n  scratch[0..15] ours  (as flt): ";
-        if (wb.mUncompressedBlkDataScratch) {
-            for (int i = 0; i < 16; ++i) {
-                float f;
-                std::memcpy(&f, &wb.mUncompressedBlkDataScratch[i], 4);
-                std::cout << ' ' << f;
-            }
-        }
-        std::cout << "\n";
-        // Dump the first 64 bytes of the captured compressed data so we can
-        // see exactly what bit-stream input the bit decoder is being fed.
-        // Byte 0 is the leading-skip count; bytes 1..N are the bit stream.
-        std::cout << "  cmpData[0..63]:" << std::hex << std::setfill('0');
-        for (int i = 0; i < 64 && i < (int)sizeof(p->cmpDataDump); ++i) {
-            if (i == 32) std::cout << "\n                ";
-            std::cout << ' ' << std::setw(2) << (unsigned)p->cmpDataDump[i];
-        }
-        std::cout << std::setfill(' ') << std::dec << "\n";
-        // Also print the start of mCompressedHeaderData (control nibble
-        // stream). The work buffer's mNumBitsOffset tells where ctrl bytes
-        // begin within mCompressedHeaderData.
-        std::cout << "  cmpHdr[0..63]:" << std::hex << std::setfill('0');
-        for (int i = 0; i < (int)sizeof(ip->cmpHdrDump); ++i) {
-            if (i == 32) std::cout << "\n               ";
-            std::cout << ' ' << std::setw(2) << (unsigned)ip->cmpHdrDump[i];
-        }
-        std::cout << std::setfill(' ') << std::dec
-                  << "\n  mNumBitsOffset=" << wb.mNumBitsOffset
-                  << " (ctrl bytes start at cmpHdr[" << wb.mNumBitsOffset << "])\n";
-        // Print the first few ctrl words and what we'd interpret as nibbles.
-        if (wb.mNumBitsOffset < 60u && wb.mCompressedHeaderData) {
-            const uint8_t* ctrlBase = wb.mCompressedHeaderData + wb.mNumBitsOffset;
-            std::cout << "  first ctrl words (BE):";
-            for (int e = 0; e < std::min<int>(4, (int)wb.mFrameOffset); ++e) {
-                uint32_t cw = ((uint32_t)ctrlBase[e*4+0] << 24)
-                            | ((uint32_t)ctrlBase[e*4+1] << 16)
-                            | ((uint32_t)ctrlBase[e*4+2] << 8)
-                            |  (uint32_t)ctrlBase[e*4+3];
-                std::cout << " 0x" << std::hex << std::setw(8) << std::setfill('0')
-                          << cw << std::dec << std::setfill(' ');
-            }
-            std::cout << "\n";
-        }
-        if (!scratchOK) {
-            std::cout << "  uncompressedScratch first diff at int " << firstScratchDiff << ":\n";
-            std::cout << "    recomp:";
-            for (int i = firstScratchDiff; i < firstScratchDiff + 8 && i < 256; ++i) {
-                int32_t v = (int32_t)beU32(p->uncompressedScratch_post + i * 4);
-                std::cout << ' ' << v;
-            }
-            std::cout << "\n    ours  :";
-            for (int i = firstScratchDiff; i < firstScratchDiff + 8 && i < 256; ++i) {
-                std::cout << ' ' << wb.mUncompressedBlkDataScratch[i];
-            }
-            std::cout << "\n";
-        }
-        if (!normOK) {
-            std::cout << "  normalizedData first diff at float " << firstNormDiff << ":\n";
-            std::cout << "    recomp:";
-            for (int i = firstNormDiff; i < firstNormDiff + 8 && i < 256; ++i) {
-                std::cout << ' ' << beFloat(p->normalizedData_post + i * 4);
-            }
-            std::cout << "\n    ours  :";
-            for (int i = firstNormDiff; i < firstNormDiff + 8 && i < 256; ++i) {
-                std::cout << ' ' << wb.mNormalizedData[i];
-            }
-            std::cout << "\n";
-        }
-    }
-
-    std::cout << "\n=== Vector_UnPack diff summary ===\n";
-    std::cout << "  records                       : " << vupRecords << "\n";
-    std::cout << "  matched                       : " << vupMatched << "\n";
-    std::cout << "  with bit decoder firing       : " << vupAnimated
-              << " (mFrameOffset > 0)\n";
-    std::cout << "  scratch (bit-decode) mismatch : " << vupScratchMismatches << "\n";
-    std::cout << "  normalized (IDCT)    mismatch : " << vupNormMismatches    << "\n";
-    if (vupAnimated == 0) {
-        std::cout << "  NOTE: trace contains no animated clips (all mFrameOffset=0).\n"
-                  << "        The bit decoder is unverified -- capture a trace from\n"
-                  << "        gameplay where characters animate to exercise it.\n";
-    }
-
-    delete dec;
-    return 0;
-}
-
-static int run(const char* tracePath) {
-    std::ifstream in(tracePath, std::ios::binary);
-    if (!in) {
-        std::cout << "Cannot open " << tracePath << "\n";
-        return 1;
-    }
-    char magic[8];
-    in.read(magic, 8);
-    if (std::memcmp(magic, "VBRTRACE", 8) != 0) {
-        std::cout << "Not a VBRTRACE file\n";
-        return 1;
-    }
-    uint32_t version = 0;
-    in.read(reinterpret_cast<char*>(&version), 4);
-    std::cout << "Trace version " << version << ", path=" << tracePath << "\n\n";
-
-    // Tally per kind.
-    int counts[6] = {0};
-    int total = 0;
-
-    while (in.peek() != EOF) {
-        char marker[4];
-        in.read(marker, 4);
-        if (in.gcount() != 4) break;
-        if (std::memcmp(marker, "REC0", 4) != 0) {
-            std::cout << "Bad marker, stopping\n";
-            break;
-        }
-        uint32_t kind = 0, idx = 0, sz = 0;
-        in.read(reinterpret_cast<char*>(&kind), 4);
-        in.read(reinterpret_cast<char*>(&idx),  4);
-        in.read(reinterpret_cast<char*>(&sz),   4);
-        std::vector<uint8_t> payload(sz);
-        in.read(reinterpret_cast<char*>(payload.data()), sz);
-        if (kind >= 1 && kind <= 5) counts[kind]++;
-        total++;
-
-        if (total <= 10 || total % 10 == 0) {
-            std::cout << "[#" << idx << "] " << kindName(kind)
-                      << " (kind=" << kind << ", " << sz << "B)";
-            if (kind == 1 && sz >= sizeof(InitPerAnimPayload)) {
-                auto* p = reinterpret_cast<const InitPerAnimPayload*>(payload.data());
-                std::cout << "  this=0x" << std::hex << p->this_ptr
-                          << " hdr=0x" << p->headerData
-                          << " cmpHdr=0x" << p->compressedHeaderData
-                          << " tid=" << std::dec << p->threadId
-                          << " result=" << p->result;
-            } else if (kind == 5 && sz >= sizeof(DecompressFramePayload)) {
-                auto* p = reinterpret_cast<const DecompressFramePayload*>(payload.data());
-                std::cout << "  this=0x" << std::hex << p->this_ptr
-                          << " cmpData=0x" << p->compressedData
-                          << " frame=" << std::dec << p->frame
-                          << " putLoc=0x" << std::hex << p->putLoc
-                          << " tid=" << std::dec << p->threadId;
-            } else if (kind == 3 && sz >= sizeof(VectorUnPackPayload)) {
-                auto* p = reinterpret_cast<const VectorUnPackPayload*>(payload.data());
-                std::cout << "  pCmp=0x" << std::hex << p->pCompressedData
-                          << " pWB=0x" << p->pWorkBuffer
-                          << " frameinBlk=" << std::dec << p->frameinBlk
-                          << " tid=" << p->threadId;
-            }
-            std::cout << "\n";
-        }
-    }
-
-    std::cout << "\n=== summary ===\n";
-    std::cout << "  total records       : " << total << "\n";
-    for (int k = 1; k <= 5; ++k) {
-        std::cout << "  " << kindName(k) << " (" << k << "): " << counts[k] << "\n";
-    }
-    std::cout << "\n";
-
-    // Print one fully detailed example of each kind.
-    in.clear();
-    in.seekg(12);  // skip header
-    bool shown[6] = {false};
-    while (in.peek() != EOF) {
-        char marker[4];
-        in.read(marker, 4);
-        if (in.gcount() != 4) break;
-        uint32_t kind = 0, idx = 0, sz = 0;
-        in.read(reinterpret_cast<char*>(&kind), 4);
-        in.read(reinterpret_cast<char*>(&idx),  4);
-        in.read(reinterpret_cast<char*>(&sz),   4);
-        std::vector<uint8_t> payload(sz);
-        in.read(reinterpret_cast<char*>(payload.data()), sz);
-        if (kind < 1 || kind > 5 || shown[kind]) continue;
-        shown[kind] = true;
-
-        std::cout << "\n--- first " << kindName(kind) << " (record #" << idx << ") ---\n";
-        if (kind == 1) {
-            auto* p = reinterpret_cast<const InitPerAnimPayload*>(payload.data());
-            std::cout << "  args: this=0x" << std::hex << p->this_ptr
-                      << " cmpHdr=0x" << p->compressedHeaderData
-                      << " hdr=0x" << p->headerData
-                      << " tid=" << std::dec << p->threadId
-                      << " -> result=0x" << std::hex << p->result << std::dec << "\n";
-            dumpBytes("workBuffer_pre",   p->workBuffer_pre,   sizeof(p->workBuffer_pre));
-            dumpBytes("workBuffer_post",  p->workBuffer_post,  sizeof(p->workBuffer_post));
-            dumpBytes("mhdrWrapper_pre",  p->mhdrWrapper_pre,  sizeof(p->mhdrWrapper_pre), 2);
-            dumpBytes("mhdrWrapper_post", p->mhdrWrapper_post, sizeof(p->mhdrWrapper_post), 2);
-            dumpBytes("headerDump",       p->headerDump,       sizeof(p->headerDump), 8);
-            dumpBytes("cmpHdrDump",       p->cmpHdrDump,       sizeof(p->cmpHdrDump));
-        } else if (kind == 2) {
-            auto* p = reinterpret_cast<const UnPackHeaderBitsPayload*>(payload.data());
-            std::cout << "  args: this=0x" << std::hex << p->this_ptr
-                      << " pWB=0x" << p->pWorkBuffer
-                      << " -> result=0x" << p->result << std::dec
-                      << "  ptrs: mConstData=0x" << std::hex << p->mConstDataPtr
-                      << " mIsConst=0x" << p->mIsConstantPtr
-                      << " cmpHdr=0x" << p->mCompressedHeaderDataPtr << std::dec << "\n";
-            dumpBytes("workBuffer_pre",  p->workBuffer_pre,  sizeof(p->workBuffer_pre));
-            dumpBytes("workBuffer_post", p->workBuffer_post, sizeof(p->workBuffer_post));
-            dumpBytes("mhdrWrapper",     p->mhdrWrapper,     sizeof(p->mhdrWrapper), 2);
-            dumpBytes("cmpHdrDump",      p->mCompressedHeaderDump, sizeof(p->mCompressedHeaderDump), 4);
-            dumpBytes("mConstData_post", p->mConstData_post, sizeof(p->mConstData_post), 4);
-            dumpBytes("mIsConst_post",   p->mIsConstantChannel_post, sizeof(p->mIsConstantChannel_post), 2);
-        } else if (kind == 3) {
-            auto* p = reinterpret_cast<const VectorUnPackPayload*>(payload.data());
-            std::cout << "  args: this=0x" << std::hex << p->this_ptr
-                      << " pCmp=0x" << p->pCompressedData
-                      << " pWB=0x" << p->pWorkBuffer
-                      << " frameinBlk=" << std::dec << p->frameinBlk
-                      << " tid=" << p->threadId << "\n";
-            dumpBytes("workBuffer_pre",      p->workBuffer_pre,      sizeof(p->workBuffer_pre));
-            dumpBytes("mhdrWrapper",         p->mhdrWrapper,         sizeof(p->mhdrWrapper), 2);
-            dumpBytes("cmpDataDump",         p->cmpDataDump,         sizeof(p->cmpDataDump), 4);
-            dumpBytes("uncompressed_post",   p->uncompressedScratch_post, sizeof(p->uncompressedScratch_post), 4);
-            dumpBytes("normalized_post",     p->normalizedData_post, sizeof(p->normalizedData_post), 4);
-        } else if (kind == 4) {
-            auto* p = reinterpret_cast<const DecompressFrameBlockPayload*>(payload.data());
-            std::cout << "  args: this=0x" << std::hex << p->this_ptr
-                      << " frameinBlk=" << std::dec << p->frameinBlk
-                      << " pWB=0x" << std::hex << p->pWorkBuffer
-                      << " tid=" << std::dec << p->threadId << "\n";
-            dumpBytes("workBuffer_pre",       p->workBuffer_pre, sizeof(p->workBuffer_pre));
-            dumpBytes("uncompressed_pre",     p->uncompressedScratch_pre, sizeof(p->uncompressedScratch_pre), 4);
-            dumpBytes("normalized_post",      p->normalizedData_post, sizeof(p->normalizedData_post), 4);
-        } else if (kind == 5) {
-            auto* p = reinterpret_cast<const DecompressFramePayload*>(payload.data());
-            std::cout << "  args: this=0x" << std::hex << p->this_ptr
-                      << " cmpData=0x" << p->compressedData
-                      << " frame=" << std::dec << p->frame
-                      << " putLoc=0x" << std::hex << p->putLoc
-                      << " tid=" << std::dec << p->threadId << "\n";
-            dumpBytes("workBuffer_pre",  p->workBuffer_pre,  sizeof(p->workBuffer_pre));
-            dumpBytes("workBuffer_post", p->workBuffer_post, sizeof(p->workBuffer_post));
-            dumpBytes("cmpDataDump",     p->cmpDataDump,     sizeof(p->cmpDataDump), 4);
-            dumpBytes("putLoc_pre",      p->putLoc_pre,      sizeof(p->putLoc_pre), 4);
-            dumpBytes("putLoc_post",     p->putLoc_post,     sizeof(p->putLoc_post), 4);
-        }
-    }
-
-    return 0;
-}
-
-} // namespace vbr_compare
-
-//testing
 int main(int argc, char** argv) {
-    // CLI: --trace <path> reads the rexglue VBR trace and prints a summary.
-    if (argc >= 2 && std::string(argv[1]) == "--trace") {
-        const char* path = (argc >= 3)
-            ? argv[2]
-            : "C:/Users/tuukk/Desktop/vbr_trace.bin";
-        return vbr_compare::run(path);
-    }
-    // CLI: --trace-csv [tracePath] [csvPath]
-    // Converts every DecompressFrame record's putLoc_post to a per-bone CSV
-    // matching AnimTest's CSV format, so you can diff ground truth against
-    // AnimTest's own output.
-    if (argc >= 2 && std::string(argv[1]) == "--trace-csv") {
-        const char* tracePath = (argc >= 3) ? argv[2] : "C:/Users/tuukk/Desktop/vbr_trace.bin";
-        const char* csvPath   = (argc >= 4) ? argv[3] : "C:/Users/tuukk/Desktop/vbr_trace_decompress.csv";
-        return vbr_compare::exportFramesCsv(tracePath, csvPath);
-    }
-    // CLI: --trace-diff [tracePath]
-    // Replays each InitPerAnim record through our local decoder and reports
-    // any field-level divergence vs the recomp's recorded outputs.
-    if (argc >= 2 && std::string(argv[1]) == "--trace-diff") {
-        const char* path = (argc >= 3) ? argv[2] : "C:/Users/tuukk/Desktop/vbr_trace.bin";
-        return vbr_compare::diff(path);
-    }
     static const char* kDefaultDBs[] = {
         "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/SkaterLeftHandPres.abin",
         "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/animationDB.abin",
         "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/cac_female_throwarms.abin",
         "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/cac_viewer_male.abin",
-        "G:/Skate 2 (USA) (En,Fr)/PS3_GAME/USRDIR/data/big/data/anim/OnBoard.abin",
+        "G:/Skate 3 (USA, Asia) (En,Fr,Es)/PS3_GAME/USRDIR/data/big/data abin/ALL ABINS/OnBoard.abin",
     };
 
     // 1. Pick database: command-line arg overrides; otherwise show menu of defaults.
@@ -5255,7 +3927,12 @@ int main(int argc, char** argv) {
                     reinterpret_cast<Andale::DataBaseManager*>(fs.mDataBaseManager)->GetPoseHeader(guid);
                 if (hdr) {
                     auto* decompressor = reinterpret_cast<ANIM_CODEC::VBRDecompressor*>(fs.mDecompressor);
-                    uint32_t written = Andale::ExtractAllVBRParts(hdr, 0, decompressor, rawSQT, nbBones);
+                    DumpSkeletonVsClipIDs(
+                        reinterpret_cast<const Andale::HierarchyData*>(fs.mSkel),
+                        hdr, /*isPose=*/true);
+                    uint32_t written = Andale::ExtractAllVBRParts(
+                        hdr, 0, decompressor, rawSQT, nbBones, /*isPose=*/true,
+                        reinterpret_cast<const Andale::HierarchyData*>(fs.mSkel));
                     std::cout << "  ExtractAllVBRParts wrote " << written << " bones\n";
                 }
             } else {
@@ -5284,7 +3961,14 @@ int main(int argc, char** argv) {
                 std::memset(rawSQT, 0, nbBones * sizeof(Andale::SQTData));
                 if (useSkeletonFreeVBR && hdr) {
                     auto* decompressor = reinterpret_cast<ANIM_CODEC::VBRDecompressor*>(fs.mDecompressor);
-                    Andale::ExtractAllVBRParts(hdr, f, decompressor, rawSQT, nbBones);
+                    if (f == 0) {
+                        DumpSkeletonVsClipIDs(
+                            reinterpret_cast<const Andale::HierarchyData*>(fs.mSkel),
+                            hdr, /*isPose=*/false);
+                    }
+                    Andale::ExtractAllVBRParts(
+                        hdr, f, decompressor, rawSQT, nbBones, /*isPose=*/false,
+                        reinterpret_cast<const Andale::HierarchyData*>(fs.mSkel));
                 } else {
                     fs.GetSQTs(guid, f, output);
                 }
